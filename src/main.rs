@@ -1,73 +1,80 @@
 use chrono::Local;
 use env_logger::Builder;
-use log::{error, info, LevelFilter};
+use log::{debug, error, info, LevelFilter};
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream};
-use std::str;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-struct ContainerBridge {
-    container1_addr: SocketAddr,
-    container2_addr: SocketAddr,
+struct DatabaseProxy {
+    listen_addr: SocketAddr,
+    db_addr: SocketAddr,
 }
 
-impl ContainerBridge {
-    fn new(container1_addr: SocketAddr, container2_addr: SocketAddr) -> Self {
-        ContainerBridge {
-            container1_addr,
-            container2_addr,
+impl DatabaseProxy {
+    fn new(listen_addr: SocketAddr, db_addr: SocketAddr) -> Self {
+        DatabaseProxy {
+            listen_addr,
+            db_addr,
         }
     }
 
     fn start(&self) -> std::io::Result<()> {
         info!(
-            "Attempting to connect {} and {}",
-            self.container1_addr, self.container2_addr
+            "Starting database proxy: Listening on {}, forwarding to DB at {}",
+            self.listen_addr, self.db_addr
         );
 
-        loop {
-            match (
-                TcpStream::connect(self.container1_addr),
-                TcpStream::connect(self.container2_addr),
-            ) {
-                (Ok(stream1), Ok(stream2)) => {
-                    info!("Connected to both containers!");
-                    self.handle_connection(stream1, stream2)?;
+        let listener = TcpListener::bind(self.listen_addr)?;
+
+        for stream in listener.incoming() {
+            match stream {
+                Ok(api_stream) => {
+                    info!("New connection from API container");
+                    let db_addr = self.db_addr;
+                    thread::spawn(move || {
+                        if let Err(e) = handle_connection(api_stream, db_addr) {
+                            error!("Error handling connection: {}", e);
+                        }
+                    });
                 }
-                _ => {
-                    error!("Couldn't connect to both containers. Retrying in 5 seconds...");
-                    std::thread::sleep(Duration::from_secs(5));
+                Err(e) => {
+                    error!("Error accepting connection: {}", e);
                 }
             }
         }
-    }
-
-    fn handle_connection(
-        &self,
-        mut stream1: TcpStream,
-        mut stream2: TcpStream,
-    ) -> std::io::Result<()> {
-        let mut stream1_clone = stream1.try_clone()?;
-        let mut stream2_clone = stream2.try_clone()?;
-
-        let handle1 = thread::spawn(move || {
-            forward_data(&mut stream1, &mut stream2_clone, "Container1 -> Container2")
-        });
-
-        let handle2 = thread::spawn(move || {
-            forward_data(&mut stream2, &mut stream1_clone, "Container2 -> Container1")
-        });
-
-        handle1.join().unwrap()?;
-        handle2.join().unwrap()?;
-
         Ok(())
     }
 }
 
+fn handle_connection(mut api_stream: TcpStream, db_addr: SocketAddr) -> std::io::Result<()> {
+    let mut db_stream = match TcpStream::connect_timeout(&db_addr, Duration::from_secs(5)) {
+        Ok(stream) => stream,
+        Err(e) => {
+            error!("Failed to connect to DB: {}", e);
+            return Err(e);
+        }
+    };
+
+    info!("Connected to database at {}", db_addr);
+
+    let mut api_stream_clone = api_stream.try_clone()?;
+    let mut db_stream_clone = db_stream.try_clone()?;
+
+    let handle1 =
+        thread::spawn(move || forward_data(&mut api_stream, &mut db_stream_clone, "API -> DB"));
+
+    let handle2 =
+        thread::spawn(move || forward_data(&mut db_stream, &mut api_stream_clone, "DB -> API"));
+
+    handle1.join().unwrap()?;
+    handle2.join().unwrap()?;
+
+    Ok(())
+}
+
 fn forward_data(from: &mut TcpStream, to: &mut TcpStream, direction: &str) -> std::io::Result<()> {
-    let mut buffer = [0; 1024];
+    let mut buffer = [0; 8192]; // Increased buffer size for better performance
     loop {
         match from.read(&mut buffer) {
             Ok(0) => break,
@@ -75,13 +82,39 @@ fn forward_data(from: &mut TcpStream, to: &mut TcpStream, direction: &str) -> st
                 let data = &buffer[..n];
                 info!("{}: {} bytes", direction, n);
 
-                // Try to display the data as UTF-8 string
-                match str::from_utf8(data) {
-                    Ok(s) => info!("{}: Data: {}", direction, s.trim()),
-                    Err(_) => info!("{}: Data: {:?} (non UTF-8)", direction, data),
+                // Log all data in hexadecimal format
+                debug!("{}: Hex data: {:02X?}", direction, data);
+
+                // Try to display printable ASCII characters
+                let ascii_string: String = data
+                    .iter()
+                    .map(|&c| {
+                        if c.is_ascii_graphic() || c.is_ascii_whitespace() {
+                            c as char
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect();
+                debug!("{}: ASCII representation: {}", direction, ascii_string);
+
+                // Check for specific patterns
+                if data.starts_with(b"Q") {
+                    info!("{}: Possible PostgreSQL query detected", direction);
+                } else if data.starts_with(b"HTTP/1.1")
+                    || data.starts_with(b"GET")
+                    || data.starts_with(b"POST")
+                {
+                    info!("{}: HTTP traffic detected", direction);
+                    if let Ok(s) = std::str::from_utf8(data) {
+                        if let Some(status_line) = s.lines().next() {
+                            info!("{}: HTTP Status/Request: {}", direction, status_line);
+                        }
+                    }
                 }
 
                 to.write_all(data)?;
+                to.flush()?;
             }
             Err(e) => {
                 error!("{}: Error reading data: {}", direction, e);
@@ -93,9 +126,9 @@ fn forward_data(from: &mut TcpStream, to: &mut TcpStream, direction: &str) -> st
     Ok(())
 }
 
-fn prompt_for_address(service: &str) -> SocketAddr {
+fn prompt_for_address(prompt: &str) -> SocketAddr {
     loop {
-        println!("Enter the address for {} (e.g., 127.0.0.1:3000):", service);
+        println!("{}", prompt);
         let mut input = String::new();
         io::stdin()
             .read_line(&mut input)
@@ -118,15 +151,24 @@ fn setup_logger() -> Result<(), io::Error> {
                 record.args()
             )
         })
-        .filter(None, LevelFilter::Info)
+        .filter(None, LevelFilter::Debug)
         .init();
     Ok(())
 }
 
 fn main() -> std::io::Result<()> {
     setup_logger().expect("Failed to initialize logger");
-    let container1_addr = prompt_for_address("Container 1");
-    let container2_addr = prompt_for_address("Container 2");
-    let bridge = ContainerBridge::new(container1_addr, container2_addr);
-    bridge.start()
+
+    let listen_addr = prompt_for_address("Enter the address for this proxy to listen on (should be different from the actual DB port, e.g., 0.0.0.0:15432):");
+    let db_addr = prompt_for_address(
+        "Enter the actual address of the DB container (e.g., 0.0.0.0:5432 or 172.17.0.3:5432):",
+    );
+
+    if listen_addr == db_addr {
+        error!("The proxy listen address must be different from the actual DB address.");
+        std::process::exit(1);
+    }
+
+    let proxy = DatabaseProxy::new(listen_addr, db_addr);
+    proxy.start()
 }
