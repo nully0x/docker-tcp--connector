@@ -132,6 +132,7 @@ dependencies = [
  "chrono",
  "env_logger",
  "log",
+ "regex",
 ]
 
 [[package]]
