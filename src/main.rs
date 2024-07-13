@@ -6,34 +6,34 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-struct DatabaseProxy {
+struct ServiceProxy {
     listen_addr: SocketAddr,
-    db_addr: SocketAddr,
+    target_addr: SocketAddr,
 }
 
-impl DatabaseProxy {
-    fn new(listen_addr: SocketAddr, db_addr: SocketAddr) -> Self {
-        DatabaseProxy {
+impl ServiceProxy {
+    fn new(listen_addr: SocketAddr, target_addr: SocketAddr) -> Self {
+        ServiceProxy {
             listen_addr,
-            db_addr,
+            target_addr,
         }
     }
 
     fn start(&self) -> std::io::Result<()> {
         info!(
-            "Starting database proxy: Listening on {}, forwarding to DB at {}",
-            self.listen_addr, self.db_addr
+            "Starting service proxy: Listening on {}, forwarding to target service at {}",
+            self.listen_addr, self.target_addr
         );
 
         let listener = TcpListener::bind(self.listen_addr)?;
 
         for stream in listener.incoming() {
             match stream {
-                Ok(api_stream) => {
-                    info!("New connection from API container");
-                    let db_addr = self.db_addr;
+                Ok(client_stream) => {
+                    info!("New connection from client service");
+                    let target_addr = self.target_addr;
                     thread::spawn(move || {
-                        if let Err(e) = handle_connection(api_stream, db_addr) {
+                        if let Err(e) = handle_connection(client_stream, target_addr) {
                             error!("Error handling connection: {}", e);
                         }
                     });
@@ -47,25 +47,35 @@ impl DatabaseProxy {
     }
 }
 
-fn handle_connection(mut api_stream: TcpStream, db_addr: SocketAddr) -> std::io::Result<()> {
-    let mut db_stream = match TcpStream::connect_timeout(&db_addr, Duration::from_secs(5)) {
+fn handle_connection(mut client_stream: TcpStream, target_addr: SocketAddr) -> std::io::Result<()> {
+    let mut target_stream = match TcpStream::connect_timeout(&target_addr, Duration::from_secs(5)) {
         Ok(stream) => stream,
         Err(e) => {
-            error!("Failed to connect to DB: {}", e);
+            error!("Failed to connect to target service: {}", e);
             return Err(e);
         }
     };
 
-    info!("Connected to database at {}", db_addr);
+    info!("Connected to target service at {}", target_addr);
 
-    let mut api_stream_clone = api_stream.try_clone()?;
-    let mut db_stream_clone = db_stream.try_clone()?;
+    let mut client_stream_clone = client_stream.try_clone()?;
+    let mut target_stream_clone = target_stream.try_clone()?;
 
-    let handle1 =
-        thread::spawn(move || forward_data(&mut api_stream, &mut db_stream_clone, "API -> DB"));
+    let handle1 = thread::spawn(move || {
+        forward_data(
+            &mut client_stream,
+            &mut target_stream_clone,
+            "Client -> Target",
+        )
+    });
 
-    let handle2 =
-        thread::spawn(move || forward_data(&mut db_stream, &mut api_stream_clone, "DB -> API"));
+    let handle2 = thread::spawn(move || {
+        forward_data(
+            &mut target_stream,
+            &mut client_stream_clone,
+            "Target -> Client",
+        )
+    });
 
     handle1.join().unwrap()?;
     handle2.join().unwrap()?;
@@ -98,19 +108,17 @@ fn forward_data(from: &mut TcpStream, to: &mut TcpStream, direction: &str) -> st
                     .collect();
                 debug!("{}: ASCII representation: {}", direction, ascii_string);
 
-                // Check for specific patterns
-                if data.starts_with(b"Q") {
-                    info!("{}: Possible PostgreSQL query detected", direction);
-                } else if data.starts_with(b"HTTP/1.1")
-                    || data.starts_with(b"GET")
-                    || data.starts_with(b"POST")
-                {
-                    info!("{}: HTTP traffic detected", direction);
-                    if let Ok(s) = std::str::from_utf8(data) {
+                // Basic protocol detection
+                if let Ok(s) = std::str::from_utf8(data) {
+                    if s.starts_with("HTTP/") || s.starts_with("GET ") || s.starts_with("POST ") {
+                        info!("{}: HTTP traffic detected", direction);
                         if let Some(status_line) = s.lines().next() {
                             info!("{}: HTTP Status/Request: {}", direction, status_line);
                         }
+                    } else if s.starts_with("Q") {
+                        info!("{}: Possible database query detected", direction);
                     }
+                    //todo!() // Add more protocol detections as needed
                 }
 
                 to.write_all(data)?;
@@ -159,16 +167,16 @@ fn setup_logger() -> Result<(), io::Error> {
 fn main() -> std::io::Result<()> {
     setup_logger().expect("Failed to initialize logger");
 
-    let listen_addr = prompt_for_address("Enter the address for this proxy to listen on (should be different from the actual DB port, e.g., 0.0.0.0:15432):");
-    let db_addr = prompt_for_address(
-        "Enter the actual address of the DB container (e.g., 0.0.0.0:5432 or 172.17.0.3:5432):",
-    );
+    let listen_addr =
+        prompt_for_address("Enter the address for this proxy to listen on (e.g., 0.0.0.0:8080):");
+    let target_addr =
+        prompt_for_address("Enter the address of the target service (e.g., 172.17.0.3:5000):");
 
-    if listen_addr == db_addr {
-        error!("The proxy listen address must be different from the actual DB address.");
+    if listen_addr == target_addr {
+        error!("The proxy listen address must be different from the target service address.");
         std::process::exit(1);
     }
 
-    let proxy = DatabaseProxy::new(listen_addr, db_addr);
+    let proxy = ServiceProxy::new(listen_addr, target_addr);
     proxy.start()
 }
